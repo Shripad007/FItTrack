@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16a34a">
+<title>FitTrack - Health and Activity</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--text:#1d2630;--muted:#6b7785;--pri:#16a34a;--walk:#2563eb;--cycle:#f59e0b;--danger:#dc2626;--border:#e3e8ee;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1418;--card:#1a2129;--text:#e6ebf0;--muted:#94a0ad;--border:#2a333d;color-scheme:dark}}
+*{box-sizing:border-box}
+:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+#app{max-width:480px;margin:0 auto;padding:16px 16px 100px}
+h1{margin:0 0 8px;font-size:26px}
+h2{margin:0 0 12px;font-size:17px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;margin-bottom:14px}
+.row{display:flex;gap:10px;align-items:center}
+.grow{flex:1}
+input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:16px;margin-bottom:10px}
+button{font:inherit;border:0;border-radius:12px;padding:12px 16px;background:var(--pri);color:#fff;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--border)}
+button.walk{background:var(--walk)}
+button.cycle{background:var(--cycle)}
+button.danger{background:var(--danger)}
+.muted{color:var(--muted);font-size:14px}
+.big{font-size:40px;font-weight:700;font-variant-numeric:tabular-nums}
+.stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;text-align:center}
+.stats div{font-size:12px;color:var(--muted)}
+.stats b{display:block;font-size:20px;color:var(--text)}
+nav{position:fixed;bottom:0;left:0;right:0;max-width:480px;margin:0 auto;background:var(--card);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:8px 4px calc(8px + env(safe-area-inset-bottom,0px))}
+nav button{background:none;color:var(--muted);padding:6px 4px;font-size:12px;font-weight:500}
+nav button.on{color:var(--pri)}
+.item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 0;border-bottom:1px solid var(--border)}
+.item:last-child{border-bottom:0}
+.tag{font-size:12px;padding:3px 8px;border-radius:999px;color:#fff}
+canvas#map{width:100%;height:260px;display:block;border-radius:12px;background:var(--bg)}
+.chart-box{position:relative;height:220px}
+.err{color:var(--danger);font-size:14px;min-height:18px;margin-bottom:6px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<nav id="nav"></nav>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const KEY='fittrack_db';
+let db;
+try{db=JSON.parse(localStorage.getItem(KEY))}catch(e){}
+if(!db)db={users:{},session:null,acts:{}};
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(db))}catch(e){}};
+
+const MET={walk:3.5,cycle:7.5};      // metabolic equivalents
+const SPEED={walk:1.4,cycle:5};      // m/s, used only when GPS is unavailable
+const COL={walk:'#2563eb',cycle:'#f59e0b'};
+const TABS=[['home','Home'],['activity','Activity'],['stats','Stats'],['map','Map'],['profile','Profile']];
+
+let view='home', authMode='login', cur=null, charts=[], selected=null;
+
+const v=id=>document.getElementById(id).value;
+const me=()=>db.session?db.users[db.session]:null;
+const myActs=()=>{if(!db.session)return[];db.acts[db.session]=db.acts[db.session]||[];return db.acts[db.session]};
+const uid=()=>Date.now()*1000+Math.floor(Math.random()*1000);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtT=s=>{const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(x).padStart(2,'0')+'s'};
+const hav=(a,b)=>{const R=6371,t=Math.PI/180,dl=(b[0]-a[0])*t,dg=(b[1]-a[1])*t;const x=Math.sin(dl/2)**2+Math.cos(a[0]*t)*Math.cos(b[0]*t)*Math.sin(dg/2)**2;return 2*R*Math.asin(Math.sqrt(x))};
+const kcal=(type,sec)=>MET[type]*((me()&&me().weight)||70)*sec/3600;
+const go=x=>{view=x;render()};
+const err=t=>{const e=document.getElementById('err');if(e)e.textContent=t};
+
+/* ---------- Auth ---------- */
+function register(){
+  const n=v('r-name').trim(), e=v('r-email').trim().toLowerCase(), p=v('r-pass'), w=+v('r-weight');
+  if(!n||!e.includes('@')||p.length<6)return err('Enter a name, a valid email and a password of 6+ characters.');
+  if(db.users[e])return err('Account already exists. Please log in.');
+  db.users[e]={name:n,pass:p,weight:w>0?w:70};
+  db.acts[e]=[];db.session=e;save();go('home');
+}
+function login(){
+  const e=v('l-email').trim().toLowerCase(), p=v('l-pass');
+  const u=db.users[e];
+  if(!u||u.pass!==p)return err('Wrong email or password.');
+  db.session=e;save();go('home');
+}
+function logout(){if(cur)stopAct();db.session=null;save();view='home';render()}
+function setWeight(val){if(!me())return;me().weight=+val||70;save()}
+
+function authHTML(){
+  const reg=authMode==='register';
+  return `<div style="height:40px"></div><h1>FitTrack</h1>
+  <p class="muted">Track walks and rides, calories and routes.</p>
+  <div class="card">
+    <div class="row" style="margin-bottom:12px">
+      <button class="grow ${reg?'ghost':''}" onclick="authMode='login';render()">Log in</button>
+      <button class="grow ${reg?'':'ghost'}" onclick="authMode='register';render()">Register</button>
+    </div>
+    ${reg?`<input id="r-name" placeholder="Full name"><input id="r-weight" type="number" placeholder="Weight (kg)">
+    <input id="r-email" type="email" placeholder="Email"><input id="r-pass" type="password" placeholder="Password (6+ characters)">`
+         :`<input id="l-email" type="email" placeholder="Email"><input id="l-pass" type="password" placeholder="Password">`}
+    <div class="err" id="err"></div>
+    <button style="width:100%" onclick="${reg?'register()':'login()'}">${reg?'Create account':'Log in'}</button>
+  </div>`;
+}
+
+/* ---------- Tracking ---------- */
+function startAct(type){
+  if(cur)return;
+  cur={type,start:Date.now(),pts:[],dist:0,sim:false,watch:null};
+  if(navigator.geolocation){
+    cur.watch=navigator.geolocation.watchPosition(p=>{
+      if(p.coords.accuracy>50)return;               // ignore poor fixes
+      const pt=[p.coords.latitude,p.coords.longitude];
+      if(cur.pts.length)cur.dist+=hav(cur.pts[cur.pts.length-1],pt);
+      cur.pts.push(pt);
+    },()=>{if(cur)cur.sim=true},{enableHighAccuracy:true});
+  }else cur.sim=true;
+  cur.timer=setInterval(tick,1000);
+  render();
+}
+function tick(){
+  if(!cur)return;
+  if(cur.sim)cur.dist+=SPEED[cur.type]/1000;     // 1 second of estimated movement
+  const el=(Date.now()-cur.start)/1000;
+  const t=document.getElementById('live');
+  if(t){
+    t.textContent=fmtT(Math.floor(el));
+    document.getElementById('live-d').textContent=cur.dist.toFixed(2);
+    document.getElementById('live-k').textContent=Math.round(kcal(cur.type,el));
+  }
+}
+function stopAct(){
+  if(!cur)return;
+  clearInterval(cur.timer);
+  if(cur.watch!=null)navigator.geolocation.clearWatch(cur.watch);
+  const sec=Math.max(1,Math.round((Date.now()-cur.start)/1000));
+  const rec={id:uid(),type:cur.type,date:cur.start,sec,km:+cur.dist.toFixed(2),kcal:Math.round(kcal(cur.type,sec)),route:cur.pts.slice(-2000),sim:cur.sim};
+  myActs().unshift(rec);save();
+  selected=rec.id;cur=null;go('activity');
+}
+function delAct(id){db.acts[db.session]=myActs().filter(x=>x.id!==id);save();render()}
+function openMap(id){selected=id;go('map')}
+
+/* ---------- Demo data ---------- */
+function seed(){
+  const arr=myActs();
+  for(let i=0;i<14;i++){
+    if(Math.random()<.35)continue;
+    const n=Math.random()<.3?2:1;
+    for(let j=0;j<n;j++){
+      const type=Math.random()<.6?'walk':'cycle';
+      const sec=type==='walk'?900+Math.random()*2700:1200+Math.random()*3600;
+      const start=new Date();start.setDate(start.getDate()-i);start.setHours(7+j*9,Math.floor(Math.random()*50),0,0);
+      const km=type==='walk'?sec/3600*5:sec/3600*16;
+      arr.push({id:uid(),type,date:start.getTime(),sec:Math.round(sec),km:+km.toFixed(2),kcal:Math.round(kcal(type,sec)),route:[],sim:true});
+    }
+  }
+  arr.sort((a,b)=>b.date-a.date);save();render();
+}
+
+/* ---------- Views ---------- */
+const itemHTML=x=>`<div class="item">
+  <div><span class="tag" style="background:${COL[x.type]}">${x.type==='walk'?'Walk':'Cycle'}</span>
+  <span class="muted">${new Date(x.date).toLocaleDateString(undefined,{day:'numeric',month:'short'})} · ${fmtT(x.sec)}</span>
+  <div>${x.km} km · ${x.kcal} kcal</div></div>
+  <div class="row"><button class="ghost" onclick="openMap(${x.id})">Map</button><button class="ghost" onclick="delAct(${x.id})">✕</button></div></div>`;
+
+function homeHTML(){
+  const a=myActs(), today=new Date().toDateString();
+  const t=a.filter(x=>new Date(x.date).toDateString()===today);
+  const sum=k=>t.reduce((s,x)=>s+x[k],0);
+  const running=cur
+    ?`<div class="card"><div class="muted">${cur.type==='walk'?'Walking':'Cycling'} now${cur.sim?' (estimated distance)':''}</div>
+       <div class="big" id="live">${fmtT(Math.floor((Date.now()-cur.start)/1000))}</div>
+       <div class="stats" style="margin-top:12px"><div>Distance km<b id="live-d">${cur.dist.toFixed(2)}</b></div>
+       <div>kcal<b id="live-k">${Math.round(kcal(cur.type,(Date.now()-cur.start)/1000))}</b></div><div>Status<b>Live</b></div></div>
+       <button class="danger" style="width:100%;margin-top:14px" onclick="stopAct()">Stop and save</button></div>`
+    :`<div class="card"><h2>Start an activity</h2>
+       <div class="row"><button class="walk grow" onclick="startAct('walk')">🚶 Walk</button><button class="cycle grow" onclick="startAct('cycle')">🚴 Cycle</button></div>
+       <p class="muted" style="margin:12px 0 0">Uses GPS when allowed; otherwise estimates distance.</p></div>`;
+  return `<h1>Hi, ${esc(me().name)}</h1><p class="muted">Today</p>${running}
+    <div class="card"><div class="stats"><div>Time<b>${Math.round(sum('sec')/60)}m</b></div><div>Distance<b>${sum('km').toFixed(2)}km</b></div><div>Calories<b>${sum('kcal')}</b></div></div></div>
+    <div class="card"><h2>Recent</h2>${a.slice(0,3).map(itemHTML).join('')||'<p class="muted">No activities yet. Start your first walk!</p>'}</div>
+    ${a.length?'':'<button class="ghost" style="width:100%" onclick="seed()">Load demo data</button>'}`;
+}
+function activityHTML(){
+  const a=myActs();
+  return `<h1>Activities</h1><div class="card">${a.map(itemHTML).join('')||'<p class="muted">No activities yet.</p>'}</div>`;
+}
+function mapHTML(){
+  const a=myActs();
+  const rec=a.find(x=>x.id===selected)||a[0];
+  if(!rec)return '<h1>Route map</h1><p class="muted">Complete an activity to see your route.</p>';
+  selected=rec.id;
+  const opts=a.map(x=>`<option value="${x.id}" ${x.id===rec.id?'selected':''}>${new Date(x.date).toLocaleDateString()} - ${x.type} ${x.km} km</option>`).join('');
+  return `<h1>Route map</h1><select onchange="selected=+this.value;render()">${opts}</select>
+    <div class="card" style="padding:8px"><canvas id="map"></canvas></div>
+    <p class="muted">${rec.route.length?rec.route.length+' GPS points recorded.':'No GPS route for this activity (estimated distance only).'}</p>`;
+}
+function statsHTML(){
+  return `<h1>Stats</h1>
+  <div class="card"><h2>Time split by activity (min)</h2><div class="chart-box"><canvas id="c-pie"></canvas></div></div>
+  <div class="card"><h2>Time vs activity, last 7 days (min)</h2><div class="chart-box"><canvas id="c-time"></canvas></div></div>
+  <div class="card"><h2>Calories burned, last 14 days</h2><div class="chart-box"><canvas id="c-kcal"></canvas></div></div>
+  <div class="card"><h2>Distance per day, last 14 days (km)</h2><div class="chart-box"><canvas id="c-dist"></canvas></div></div>`;
+}
+function profileHTML(){
+  const u=me(), a=myActs();
+  const km=a.reduce((s,x)=>s+x.km,0), k=a.reduce((s,x)=>s+x.kcal,0);
+  return `<h1>Profile</h1>
+  <div class="card">
+    <div class="item"><span>Name</span><b>${esc(u.name)}</b></div>
+    <div class="item"><span>Weight (kg)</span><input id="wt" type="number" value="${u.weight}" style="width:100px;margin:0" onchange="setWeight(this.value)"></div>
+    <div class="item"><span>Activities</span><b>${a.length}</b></div>
+    <div class="item"><span>Total distance</span><b>${km.toFixed(1)} km</b></div>
+    <div class="item"><span>Total calories</span><b>${k} kcal</b></div>
+  </div>
+  <button class="ghost" style="width:100%" onclick="logout()">Log out</button>`;
+}
+
+/* ---------- Charts and map ---------- */
+function days(n){const out=[];for(let i=n-1;i>=0;i--){const d=new Date();d.setHours(0,0,0,0);d.setDate(d.getDate()-i);out.push(d)}return out}
+function buildCharts(){
+  if(!window.Chart)return;
+  const a=myActs();
+  const sameDay=(x,d)=>new Date(x.date).toDateString()===d.toDateString();
+  const sum=(d,k,t)=>a.filter(x=>sameDay(x,d)&&(!t||x.type===t)).reduce((s,x)=>s+x[k],0);
+  const tot={walk:0,cycle:0};a.forEach(x=>tot[x.type]+=x.sec);
+  const d7=days(7),d14=days(14);
+  const lbl=d=>d.toLocaleDateString(undefined,{weekday:'short',day:'numeric'});
+  const mk=(id,cfg)=>charts.push(new Chart(document.getElementById(id),cfg));
+  const opts=(extra={})=>Object.assign({responsive:true,maintainAspectRatio:false},extra);
+
+  mk('c-pie',{type:'pie',data:{labels:['Walk','Cycle'],datasets:[{data:[Math.round(tot.walk/60),Math.round(tot.cycle/60)],backgroundColor:[COL.walk,COL.cycle]}]},options:opts({plugins:{legend:{position:'bottom'}}})});
+
+  mk('c-time',{type:'bar',data:{labels:d7.map(lbl),datasets:['walk','cycle'].map(t=>({label:t,backgroundColor:COL[t],data:d7.map(d=>Math.round(sum(d,'sec',t)/60))}))},
+    options:opts({scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true}}})});
+
+  mk('c-kcal',{type:'line',data:{labels:d14.map(lbl),datasets:[{label:'kcal',borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.15)',fill:true,tension:.3,data:d14.map(d=>Math.round(sum(d,'kcal')))}]},
+    options:opts({scales:{y:{beginAtZero:true}}})});
+
+  mk('c-dist',{type:'bar',data:{labels:d14.map(lbl),datasets:[{label:'km',backgroundColor:'#2563eb',data:d14.map(d=>+sum(d,'km').toFixed(2))}]},
+    options:opts({scales:{y:{beginAtZero:true}}})});
+}
+function drawMap(){
+  const c=document.getElementById('map');if(!c)return;
+  const r=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1,W=r.width,H=r.height;
+  c.width=W*dpr;c.height=H*dpr;
+  const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+  const rec=myActs().find(x=>x.id===selected);
+  const p=rec&&rec.route;
+  if(!p||p.length<2){g.fillStyle=getComputedStyle(c).color;g.globalAlpha=.6;g.font='14px system-ui';g.fillText('No route data',16,30);return}
+  const la=p.map(q=>q[0]),lo=p.map(q=>q[1]);
+  const minA=Math.min(...la),maxA=Math.max(...la),minO=Math.min(...lo),maxO=Math.max(...lo);
+  const pad=24,kx=Math.cos(((minA+maxA)/2)*Math.PI/180);
+  const w=Math.max((maxO-minO)*kx,1e-9),h=Math.max(maxA-minA,1e-9);
+  const s=Math.min((W-2*pad)/w,(H-2*pad)/h);
+  const ox=(W-w*s)/2,oy=(H-h*s)/2;
+  const X=o=>ox+(o-minO)*kx*s, Y=a=>H-oy-(a-minA)*s;
+  g.lineWidth=4;g.lineJoin='round';g.strokeStyle=COL[rec.type];g.globalAlpha=1;
+  g.beginPath();p.forEach((q,i)=>i?g.lineTo(X(q[1]),Y(q[0])):g.moveTo(X(q[1]),Y(q[0])));g.stroke();
+  const dot=(q,col)=>{g.fillStyle=col;g.beginPath();g.arc(X(q[1]),Y(q[0]),6,0,Math.PI*2);g.fill()};
+  dot(p[0],'#16a34a');dot(p[p.length-1],'#dc2626');
+}
+
+/* ---------- Render ---------- */
+function navHTML(){
+  document.getElementById('nav').innerHTML=TABS.map(([k,l])=>`<button class="${view===k?'on':''}" onclick="go('${k}')">${l}</button>`).join('');
+}
+function render(){
+  charts.forEach(c=>c.destroy());charts=[];
+  const app=document.getElementById('app');
+  if(!me()){
+    app.innerHTML=authHTML();
+    document.getElementById('nav').innerHTML='';
+    return;
+  }
+  const pages={home:homeHTML,activity:activityHTML,stats:statsHTML,map:mapHTML,profile:profileHTML};
+  app.innerHTML=pages[view]();
+  navHTML();
+  if(view==='stats')buildCharts();
+  if(view==='map')drawMap();
+}
+window.addEventListener('resize',()=>{if(view==='map')drawMap()});
+setInterval(tick,1000);
+render();
+</script>
+</body>
+</html>
